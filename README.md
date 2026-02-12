@@ -13,7 +13,7 @@ In this project, we provide interfaces for various geometric operations on 2D/3D
 **Next step:** Hybrid incremental SfM is under development and will be included in the next round of release.
 
 <p align="center">
-<img width=100% src="./misc/media/barn_lsd.gif" style="margin:-300px 0px -300px 0px">
+<img width=100% src="./misc/media/barn_lsd.gif">
 </p>
 
 ## Installation
