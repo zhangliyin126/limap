@@ -8,3 +8,14 @@ max_image_dim: 800
 input_n_views: 100
 input_stride: 1
 
+##############################
+# simple non-DL defaults for triangulation.py
+use_cuda: False
+line2d:
+    detector:
+        method: "lsd"
+    compute_descinfo: False
+triangulation:
+    use_exhaustive_matcher: True
+refinement:
+    disable: True

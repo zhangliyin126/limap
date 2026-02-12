@@ -31,8 +31,11 @@ sfm:
         range_robust: [0.05, 0.95]
         k_stretch: 1.25
     hloc:
-        descriptor: "aliked-n16"
-        matcher: "aliked-lightglue"
+        descriptor: "sift"
+        matcher: "NN-ratio"
+    # hloc:
+    #     descriptor: "aliked-n16"
+    #     matcher: "aliked-lightglue"
 
 ##############################
 # line detection and matching config
