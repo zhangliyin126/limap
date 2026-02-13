@@ -441,7 +441,50 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
 1. 检测后可选线段合并（去重复）
   - 开关：`line2d.do_merge_lines`
   - 位置：`src/limap/line2d/base_detector.py` -> `merge_lines`
-  - 算法：按正交距离和重叠关系聚类后合并（`src/limap/line2d/line_utils/merge_lines.py`）
+  - 调用链：
+    - `BaseDetector.detect_all_images` 在 `detect` 后、`take_longest_k` 前调用 `self.merge_lines(segs)`
+    - `self.merge_lines` 先把检测结果从 `(N,5)` 裁成端点 `(N,2,2)`（只保留 `x1,y1,x2,y2`，不保留 score），然后调用 `line_utils.merge_lines`
+    - 当前入口未传阈值参数，因此使用默认 `merge_lines(lines, thresh=5.0, overlap_thresh=0.0)`
+  - `merge_lines.py` 实现细节（按执行顺序）：
+    - 第 1 步：两两计算“线到线正交距离 + 重叠率”
+      - 调用 `get_orth_line_dist(lines, lines, return_overlap=True)`
+      - `project_point_to_line`：把一组线段端点正交投影到另一组线的方向上，得到
+        - 投影 1D 坐标 `coords1d`
+        - 到目标线的正交距离 `dist_to_line`
+      - 对任意线段对 `(Li, Lj)`，距离项取双向平均：
+        - `Lj` 的两个端点到 `Li` 的距离和
+        - `Li` 的两个端点到 `Lj` 的距离和
+        - 两者再取平均，得到对称的 `orth_dist[i,j]`
+      - `get_segment_overlap`：把投影到参考线上的端点坐标排序后，计算与区间 `[0,1]` 的交长度（即“在线段范围内的重叠比例”）
+      - 重叠率用双向平均 `overlaps=(overlaps1+overlaps2)/2`；同时保留双向最小值 `min_overlaps`（在非 `return_overlap` 场景会用于严格过滤）
+    - 第 2 步：构图（邻接矩阵）
+      - 默认 `overlap_thresh=0.0`：
+        - 只有 `overlaps > 0` 且 `orth_dist < thresh` 才连边
+      - 若设置 `overlap_thresh > 0`：
+        - 额外计算两条线四组端点距离的最小值 `close_endpoint`
+        - 连边条件变为 `((overlaps > 0) | (close_endpoint < overlap_thresh)) & (orth_dist < thresh)`
+        - 即允许“端点很近但本体不重叠”的共线段被合并
+    - 第 3 步：连通分量聚类
+      - 用 `scipy.sparse.csgraph.connected_components(..., directed=False)` 对无向图做连通分量分解
+      - 每个连通分量是一簇待合并线段（具备传递性：A 连 B、B 连 C 会并到同簇）
+    - 第 4 步：簇内几何合并 `merge_line_cluster`
+      - 输入：簇内线段 `(n,2,2)`，将全部端点展平为 `2n` 个点
+      - 主方向估计：
+        - 每条线按长度加权（长线权重大，且同一线的两个端点重复该权重）
+        - 计算加权协方差矩阵，并解析求 2x2 对称矩阵主特征向量 `u`
+      - 中心线构造：
+        - 取所有端点几何中心 `cross = mean(points)` 作为中心点
+        - 定义方向线 `cross + t*u`
+      - 端点重建：
+        - 将所有端点投影到该方向线上，取最小/最大投影位置对应的两点作为新线段端点
+      - 输出：该簇合并后的一条线段 `(2,2)`
+    - 第 5 步：汇总输出
+      - 所有簇分别合并后 `np.stack` 为新线段集合 `(M,2,2)`
+      - 回到 `BaseDetector.merge_lines` 再 reshape 为 `(M,4)`，供后续 `take_longest_k` 使用
+  - 实际效果与边界：
+    - 主要去掉“同方向、同位置附近”的重复检测和碎片化线段
+    - 默认 `overlap_thresh=0` 时，不会合并“仅平行接近但不重叠”的线段
+    - 合并发生在 detector 后处理阶段，且在截断 top-K 之前，因此会先减少重复，再做长度筛选
 2. 长度优先截断（抑制短碎线）
   - 参数：`line2d.max_num_2d_segs`
   - 位置：`BaseDetector.take_longest_k`
@@ -462,13 +505,100 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
 
 ### 4.3 线匹配阶段：匹配器内部抑制误配
 
-1. Mutual NN / Cross-check（L2D2、LineTR、SOLD2 等）
-2. Sinkhorn/OT 约束（`nn_endpoints`、`superglue_endpoints`）
-3. Top-k 与阈值控制
-  - 参数：`line2d.matcher.topk`
-  - 作用：限制每条线候选数，避免一对多爆炸
-4. dense matcher 的双向一致性与重叠门槛
-  - `dense_roma`（`src/limap/line2d/dense/matcher.py`）检查双向 warp、一致重叠、像素阈值
+1. 通用入口与控制面（`BaseMatcher` + 注册器）
+  - 位置：
+    - `src/limap/line2d/register_matcher.py`
+    - `src/limap/line2d/base_matcher.py`
+  - 实现：
+    - `register_matcher.get_matcher` 按 `line2d.matcher.method` 分发到 `sold2/lbd/l2d2/linetr/nn_endpoints/superglue_endpoints/gluestick/dense_roma`
+    - 统一参数 `line2d.matcher.topk` 注入到 matcher；多数实现采用：
+      - `topk == 0`：走“更严格”的一对一分支（Mutual NN / Cross-check / OT 后唯一匹配）
+      - `topk > 0`：走“候选扩展”分支（每条线保留 top-k 候选，通常不再做互检）
+    - 输出统一为 `(N,2)` 的线对索引；空输入通常返回空数组
+
+2. Mutual NN / Cross-check 具体落地
+  - `L2D2`（`src/limap/line2d/L2D2/matcher.py`）
+    - 相似度矩阵：`score_mat = desc1 @ desc2.T`
+    - 严格分支（`topk==0`）：
+      - `nearest1 = argmax(score_mat, axis=1)`，`nearest2 = argmax(score_mat, axis=0)`
+      - 仅保留 `nearest2[nearest1] == arange(len(desc1))` 的双向最近邻
+    - 候选分支（`topk>0`）：
+      - 每行按分数取前 `topk`，不做互检/阈值
+  - `LineTR`（`src/limap/line2d/LineTR/matcher.py` + `LineTR/nn_matcher.py`）
+    - 先算子线距离：`get_dist_matrix` 用 `2 - 2 * dot`（裁剪到非负）
+    - 再聚合到关键线：`subline2keyline(mat0 @ dist @ mat1.T)`
+    - 严格分支（`topk==0`）：
+      - `nn_matcher_distmat(..., nn_threshold, is_mutual_NN=True)`
+      - 同时要求“距离 < nn_threshold + 双向最近邻”
+    - 候选分支（`topk>0`）：
+      - 每行取最小距离 top-k（最近邻），不再做 mutual/阈值门槛
+  - `SOLD2`（`src/limap/line2d/SOLD2/sold2_wrapper.py` + `SOLD2/model/line_matching.py`）
+    - 核心是 `WunschLineMatcher.compute_matches`
+    - 先把每条线采样成点序列（`num_samples`、`min_dist_pts`），点描述子两两打分
+    - 线对预筛：先按“点级最大响应的双向平均”取 `top_k_candidates`
+    - 精筛：对候选执行 Needleman-Wunsch 动态规划（含反向线段），选每条线最佳匹配
+    - `cross_check=True`（默认配置）时做反向互检，不互为最佳则置 `-1`
+
+3. Sinkhorn / OT 约束（endpoints 系）
+  - 公共 OT 位置：`src/limap/point2d/superglue/superglue.py`
+    - `log_optimal_transport` + `_get_matches`
+    - `_get_matches` 内部同时做 mutual 检查与 `match_threshold`（默认 0.2）过滤
+  - `nn_endpoints`（`src/limap/line2d/endpoints/matcher.py`）
+    - 先用端点描述子点积得到端点两两分数
+    - 再合成为线对分数：
+      - `0.5 * max(d00+d11, d01+d10)`（端点顺序不敏感）
+    - 严格分支（`topk==0`）：对线对分数跑 OT，再由 `_get_matches` 输出唯一匹配
+    - 候选分支（`topk>0`）：直接按线对分数取 top-k，不跑 OT/阈值
+  - `superglue_endpoints`（同文件）
+    - 先跑 `SuperGlue(inputs)` 得到上下文增强后的点分数 `out["scores"]`
+    - 之后与 `nn_endpoints` 相同：线对分数重排 -> OT -> `_get_matches`
+    - `topk>0` 同样直接取 top-k，绕过 OT 过滤
+
+4. 图结构匹配（GlueStick）
+  - 位置：`src/limap/line2d/GlueStick/matcher.py`
+  - 输入不仅有线段，还包含 junction、junction descriptor、`lines_junc_idx` 图结构
+  - 严格分支（`topk==0`）：
+    - 调 `GlueStick` 模型，直接读取 `out["line_matches0"]`
+    - 仅保留 `!= -1` 的一对一匹配
+  - 候选分支（`topk>0`）：
+    - 读取 `raw_line_scores`，按行取 top-k
+    - wrapper 层不再加 mutual/阈值
+
+5. dense matcher 的双向一致性与重叠门槛（`dense_roma`）
+  - 位置：`src/limap/line2d/dense/matcher.py`
+  - 核心流程：
+    - 通过 RoMa 得到对称 warping：`1->2` 与 `2->1`，以及 certainty 图
+    - 每条线均匀采样 `n_samples` 点，warp 到目标图后计算：
+      - 到候选线的垂距
+      - 投影是否落在线段范围内（overlap）
+      - certainty 是否高于 `sample_thresh`
+    - 仅对“高 certainty 且在重叠区”的样本加权求平均距离
+    - 若线段有效重叠比例 `< segment_percentage_th`，该线对距离置大（拒绝）
+    - 双向融合后再加硬门槛：
+      - `min(overlap_1to2, overlap_2to1) >= segment_percentage_th`
+      - `max(dist_1to2, dist_2to1) <= pixel_th`
+  - 匹配输出：
+    - 默认 `one_to_many=False` 时，保留每条线的行最小距离（一对一倾向）
+    - `topk>0` 分支当前实现与默认分支等价，仍是“阈值内全部保留”，未显式截断 top-k
+
+6. LBD 的实现边界
+  - 位置：`src/limap/line2d/LBD/matcher.py`
+  - 严格分支（`topk==0`）：
+    - 直接调用 `pytlbd.lbd_matching_multiscale(...)`
+    - RuntimeError 时回退为空匹配
+  - 候选分支（`topk>0`）：
+    - 当前未实现（`NotImplementedError`）
+
+7. 参数如何影响“抑制误配”强度（对应源码行为）
+  - `line2d.matcher.topk = 0`：
+    - 倾向唯一匹配，更多使用 mutual/cross-check/OT 过滤，误配率通常更低
+  - `line2d.matcher.topk > 0`：
+    - 候选覆盖更高，但多数 matcher 会放宽约束并输出一对多候选
+  - method-specific 关键阈值：
+    - `LineTR`: `nn_threshold`
+    - endpoints OT: `SuperGlue.match_threshold`
+    - `dense_roma`: `segment_percentage_th`、`pixel_th`、`sample_thresh`
+    - `SOLD2`: `cross_check`、`top_k_candidates`、`num_samples/min_dist_pts`
 
 ### 4.4 三角化阶段：几何闸门过滤假匹配
 
