@@ -432,6 +432,219 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
 
 ---
 
+## 4. Triangulation 方案拆解（Base 提案生成 + Global 成轨）
+
+这一章只聚焦 `src/limap/triangulation/` 及其直接依赖，按“代码真实执行顺序”整理工程里的三角化方案。
+
+### 4.1 模块边界与分工
+
+1. Python 编排层（流程入口）
+  - 位置：`src/limap/runners/line_triangulation.py`
+  - 职责：
+    - 构造 `GlobalLineTriangulator(cfg["triangulation"])`
+    - 注入场景范围 `SetRanges(ranges)`
+    - 注入可选先验：`InitVPResults`、`SetBipartites2d`、`SetSfMPoints`
+    - 逐图调用 `TriangulateImage` / `TriangulateImageExhaustiveMatch`
+    - 最后 `ComputeLineTracks()`
+2. C++ 三角化内核
+  - 基类：`src/limap/triangulation/base_line_triangulator.{h,cc}`
+  - 派生类：`src/limap/triangulation/global_line_triangulator.{h,cc}`
+  - 职责：
+    - 基类负责“候选 3D 线提案生成”
+    - 派生类负责“跨视图打分、筛边、聚类成 track”
+3. 几何原语与求解函数
+  - 位置：`src/limap/triangulation/functions.{h,cc}`
+  - 职责：
+    - 基础几何（法向、VP 方向、E/F、epipolar IoU）
+    - 点/线三角化具体算子（代数、端点、已知点、已知方向）
+4. 轨迹合并与线段聚合
+  - 位置：
+    - `src/limap/merging/merging.cc`
+    - `src/limap/merging/aggregator.cc`
+  - 职责：
+    - 图聚类 label 生成（greedy/exhaustive/avg）
+    - 每个 track 的多条 3D 线聚合成最终一条
+
+### 4.2 核心数据结构（决定了流程形态）
+
+位置：`src/limap/triangulation/base_line_triangulator.h`
+
+1. 节点与候选定义
+  - `LineNode = (img_id, line_id)`：图节点
+  - `TriTuple = (Line3d, score, (ng_img_id, ng_line_id))`
+    - `score` 在提案阶段先占位 `-1`，由 Global 阶段打分回填
+2. 运行期容器
+  - `edges_[img][line]`：当前节点的候选连接列表（邻图线段）
+  - `tris_[img][line]`：当前节点所有三角化提案（多个来源）
+  - `neighbors_[img]`：当前图参与的邻接图像 id 列表
+  - `tracks_`：最终 `LineTrack` 输出
+3. Global 扩展容器
+  - `valid_edges_`：通过打分阈值后的连接
+  - `tris_best_`：每个节点分数最高的提案（后续建图主用）
+  - `valid_flags_`：迭代剪枝后保留节点标记
+
+### 4.3 入口时序（从匹配到三角化）
+
+位置：`src/limap/runners/line_triangulation.py`
+
+1. 初始化
+  - `Triangulator = triangulation.GlobalLineTriangulator(cfg["triangulation"])`
+  - `Triangulator.SetRanges(ranges)`
+  - `Triangulator.Init(all_2d_lines, imagecols)`
+2. 可选先验
+  - `use_vp=True`：先跑 VP 检测，再 `InitVPResults(vpresults)`
+  - `use_pointsfm.enable=True`：构造点线二部图并 `SetBipartites2d`，可选 `SetSfMPoints`
+3. 逐图三角化入口二选一
+  - `use_exhaustive_matcher=True`：
+    - `TriangulateImageExhaustiveMatch(img_id, neighbors[img_id])`
+    - 邻图内线段对穷举
+  - `use_exhaustive_matcher=False`：
+    - 读取 `matches_{img_id}.npy`
+    - `TriangulateImage(img_id, matches)`
+4. 全局聚类成轨
+  - `linetracks = Triangulator.ComputeLineTracks()`
+
+### 4.4 Base 阶段：候选 3D 线提案怎么来
+
+位置：`src/limap/triangulation/base_line_triangulator.cc`
+
+`triangulateOneNode(img_id, line_id)` 是核心。对每个 `(l1, l2)` 邻接线对，会并行尝试多种 proposal；所有通过闸门的结果都写入 `tris_[img_id][line_id]`。
+
+1. 前置过滤
+  - 2D 长度门槛：`min_length_2d`（`l1` 或 `l2` 太短直接跳过）
+2. Proposal A：PointSfM 约束（可选）
+  - 触发条件：`use_pointsfm_ == true`
+  - A1 many-points（三角化多个共享 3D 点后 TLS 拟合）
+    - 开关：`disable_many_points_triangulation`
+    - 条件：共享点数量 `>= 2`
+  - A2 one-point（已知线上一点）
+    - 开关：`disable_one_point_triangulation`
+    - 条件：至少有一个共享点
+3. Proposal B：VP 方向先验（可选）
+  - 触发条件：`use_vp=true` 且该线有 VP
+  - 开关：`disable_vp_triangulation`
+  - 算子：`triangulate_line_with_direction`
+4. Proposal C：纯两视图代数线三角化（默认主路径）
+  - 开关：`disable_algebraic_triangulation`
+  - 在求解前有三道几何闸门：
+    - 退化角过滤：`line_tri_angle_threshold`
+    - 弱极线一致性：`IoU_threshold`（`compute_epipolar_IoU`）
+    - 不稳定线过滤：`sensitivity_threshold`
+  - 求解器二选一：
+    - 默认：`triangulate_line`（射线-平面）
+    - 若 `use_endpoints_triangulation=true`：`triangulate_line_by_endpoints`
+5. 后置统一处理
+  - 计算不确定度：`line.computeUncertainty(view, var2d)`，取两视图最小值
+  - 若配置了 `SetRanges(ranges)`，执行空间范围门槛 `test_line_inside_ranges`
+  - 通过者写入 `TriTuple(line, -1.0, (ng_img_id, ng_line_id))`
+
+### 4.5 Global 阶段：如何给 proposal 打分并筛连接
+
+位置：`src/limap/triangulation/global_line_triangulator.cc`
+
+1. 调度入口
+  - `ScoringCallback(img_id)` 遍历该图所有 `line_id`
+  - 每个节点调用 `scoreOneNode`
+2. 节点打分（`scoreOneNode`）
+  - 对当前节点的每个 proposal `tri_i`：
+    - 与同节点其余 proposal `tri_j` 两两比较
+    - 仅统计来自“不同邻图”的支持
+    - 每一邻图最多贡献一个支持分（取该邻图内最大分）
+  - 单对比较分数：
+    - `score3d = linker.compute_score_3d(l_i, l_j)`
+    - `score2d = linker.compute_score_2d(proj(l_i->ng_view), ng_line2d)`
+    - `score = min(score3d, score2d)`
+  - 节点最终分：对各邻图 best support 求和
+3. 有效候选筛选
+  - 先按分数降序
+  - 只保留前 `max_valid_conns`
+  - 仅分数 `>= fullscore_th` 的 proposal 才进入 `valid_tris_` 与 `valid_edges_`
+4. 代表提案选择
+  - 每节点取分数最大 proposal 存到 `tris_best_`
+  - 后续图聚类与 track 构建基本依赖这条“代表线”
+
+### 4.6 图构建与迭代剪枝
+
+位置：`src/limap/triangulation/global_line_triangulator.cc`
+
+1. 节点先做“最小外边数”过滤
+  - 参数：`min_num_outer_edges`
+  - 实现：`filterNodeByNumOuterEdges`
+  - 机制：
+    - 先统计每节点当前有效外连数
+    - 低于阈值节点标记为无效
+    - 通过 parent 反向邻接做队列传播，迭代扣减并继续淘汰
+2. 构建无向边集合
+  - 从 `valid_edges_` 收集 `(node1, node2)`，去重后建图
+  - 两端节点必须都在 `valid_flags_` 里有效
+3. 边分数
+  - 计算了 `score_3d` 与双向投影 `score_2d`
+  - 当前实现最终 `score = score_3d`（`score_2d` 计算后未用于最终边权）
+  - 只有 `score > 0` 才入图
+
+### 4.7 聚类成 Track 与 3D 线聚合
+
+位置：
+
+- `src/limap/triangulation/global_line_triangulator.cc` -> `build_tracks_from_clusters`
+- `src/limap/merging/merging.cc`
+- `src/limap/merging/aggregator.cc`
+
+1. 轨迹标签策略（`merging_strategy`）
+  - `greedy`：最大边优先的并查集合并（快，约束较松）
+  - `exhaustive`：合并前对两簇内线段做更严格两两一致性检查
+  - `avg`：用簇平均线做兼容性检查，折中速度与约束
+2. 回填 `LineTrack` 字段
+  - 对每个图节点：
+    - 写入 `image_id_list` / `line_id_list` / `line2d_list` / `line3d_list` / `score_list`
+3. 轨迹最终 3D 线
+  - `Aggregator::aggregate_line3d_list(...)`
+  - `num_outliers_aggregator` 用于端点投影的两端截断，降低离群影响
+
+### 4.8 配置项按“作用层级”归组
+
+参考：`cfgs/triangulation/default.yaml`
+
+1. 提案生成层（Base）
+  - `min_length_2d`
+  - `use_endpoints_triangulation`
+  - `line_tri_angle_threshold`
+  - `IoU_threshold`
+  - `sensitivity_threshold`
+  - `var2d`
+  - `use_vp` + `vpdet_config`
+  - `use_pointsfm.*`
+  - `disable_*_triangulation` 四个开关
+2. 提案筛分层（Global）
+  - `fullscore_th`
+  - `max_valid_conns`
+  - `min_num_outer_edges`
+  - `linker2d_config`
+  - `linker3d_config`
+3. 轨迹构建层（Global + merging）
+  - `merging_strategy`
+  - `num_outliers_aggregator`
+4. 后处理层（runner/merging）
+  - `filtering2d.*`
+  - `remerging.*`
+  - `n_visible_views`
+
+### 4.9 调参顺序（针对“三角化本体”）
+
+1. 先稳提案质量（减少伪 3D 线）
+  - 提高 `line_tri_angle_threshold`
+  - 提高 `IoU_threshold`
+  - 降低 `sensitivity_threshold`（更严格）
+2. 再收全局筛分（减少误连接）
+  - 提高 `fullscore_th`
+  - 适当降低 `max_valid_conns`
+  - 提高 `min_num_outer_edges`
+3. 最后改聚类策略与聚合鲁棒性
+  - `greedy` 不稳时换 `avg` / `exhaustive`
+  - 适当增大 `num_outliers_aggregator`
+
+---
+
 ## 6. 误检与误匹配抑制：多级闸门 + 调参顺序
 
 你提到的“纹理密集导致重复检测、误匹配”，在 LIMAP 中不是单模块处理，而是多级闸门串联。
