@@ -296,7 +296,7 @@ outputs/quickstart_triangulation/
 
 ---
 
-## 3. Line2D 前端组件地图（detector / extractor / matcher）
+## 3. Line2D 前端组件（detector / extractor / matcher）
 
 ### 3.1 总体结构与 quickstart 影响
 
@@ -432,11 +432,11 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
 
 ---
 
-## 4. 误检与误匹配抑制：多级闸门 + 调参顺序
+## 6. 误检与误匹配抑制：多级闸门 + 调参顺序
 
 你提到的“纹理密集导致重复检测、误匹配”，在 LIMAP 中不是单模块处理，而是多级闸门串联。
 
-### 4.1 检测阶段：先压重复与低质量线
+### 6.1 检测阶段：先压重复与低质量线
 
 1. 检测后可选线段合并（去重复）
   - 开关：`line2d.do_merge_lines`
@@ -493,7 +493,7 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
   - 例如 HAWPv3 的 `thresh`，以及 SOLD2/TP-LSD/DeepLSD 的检测阈值
   - 作用：先剔除低置信线段
 
-### 4.2 匹配前约束：减少不该比较的组合
+### 6.2 匹配前约束：减少不该比较的组合
 
 1. 邻居图裁剪（不是全图互配）
   - 参数：`n_neighbors`、`sfm.min_triangulation_angle`、`sfm.neighbor_type`
@@ -503,7 +503,7 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
   - 位置：`src/limap/pointsfm/colmap_sfm.py` 的 `triangulation.estimation_and_geometric_verification`
   - 作用：先剔除几何不一致点匹配，使邻居关系更干净
 
-### 4.3 线匹配阶段：匹配器内部抑制误配
+### 6.3 线匹配阶段：匹配器内部抑制误配
 
 1. 通用入口与控制面（`BaseMatcher` + 注册器）
   - 位置：
@@ -516,7 +516,7 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
       - `topk > 0`：走“候选扩展”分支（每条线保留 top-k 候选，通常不再做互检）
     - 输出统一为 `(N,2)` 的线对索引；空输入通常返回空数组
 
-2. Mutual NN / Cross-check 具体落地
+2. Mutual NN（Mutual nearest neighbor） / Cross-check 具体落地
   - `L2D2`（`src/limap/line2d/L2D2/matcher.py`）
     - 相似度矩阵：`score_mat = desc1 @ desc2.T`
     - 严格分支（`topk==0`）：
@@ -525,6 +525,8 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
     - 候选分支（`topk>0`）：
       - 每行按分数取前 `topk`，不做互检/阈值
   - `LineTR`（`src/limap/line2d/LineTR/matcher.py` + `LineTR/nn_matcher.py`）
+    - 关键线 (keyline)：原始检测到的整条线段（输入线）
+    - 子线 (subline)：把一条关键线按 token 上限切成的若干段，便于 Transformer 编码长线
     - 先算子线距离：`get_dist_matrix` 用 `2 - 2 * dot`（裁剪到非负）
     - 再聚合到关键线：`subline2keyline(mat0 @ dist @ mat1.T)`
     - 严格分支（`topk==0`）：
@@ -539,7 +541,7 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
     - 精筛：对候选执行 Needleman-Wunsch 动态规划（含反向线段），选每条线最佳匹配
     - `cross_check=True`（默认配置）时做反向互检，不互为最佳则置 `-1`
 
-3. Sinkhorn / OT 约束（endpoints 系）
+3. Sinkhorn / OT （Optimal Transport）约束（endpoints 系）
   - 公共 OT 位置：`src/limap/point2d/superglue/superglue.py`
     - `log_optimal_transport` + `_get_matches`
     - `_get_matches` 内部同时做 mutual 检查与 `match_threshold`（默认 0.2）过滤
@@ -600,7 +602,7 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
     - `dense_roma`: `segment_percentage_th`、`pixel_th`、`sample_thresh`
     - `SOLD2`: `cross_check`、`top_k_candidates`、`num_samples/min_dist_pts`
 
-### 4.4 三角化阶段：几何闸门过滤假匹配
+### 6.4 三角化阶段：几何闸门过滤假匹配
 
 位置：`src/limap/triangulation/base_line_triangulator.cc`
 
@@ -617,7 +619,7 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
 - `use_vp`：VP 方向先验压制歧义
 - `use_pointsfm`：点-线二部图/3D 点约束候选
 
-### 4.5 全局打分与轨迹建图：再次压错误连接
+### 6.5 全局打分与轨迹建图：再次压错误连接
 
 位置：`src/limap/triangulation/global_line_triangulator.cc`
 
@@ -631,7 +633,7 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
   - 位置：`src/limap/base/line_linker.cc`
   - 规则：角度、重叠、smart-angle、垂距、innerseg、scale-inv 等联合判定
 
-### 4.6 轨迹后处理：重投影与重叠一致性过滤
+### 6.6 轨迹后处理：重投影与重叠一致性过滤
 
 位置：`src/limap/runners/line_triangulation.py` + `src/limap/merging/merging_utils.cc`
 
@@ -650,7 +652,7 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
   - 参数：`n_visible_views`
   - 动作：抑制偶然匹配支撑的线
 
-### 4.7 BA/优化阶段：鲁棒损失与弱约束冻结
+### 6.7 BA/优化阶段：鲁棒损失与弱约束冻结
 
 位置：`src/limap/optimize/line_refinement/refinement_config.h`、`src/limap/optimize/hybrid_bundle_adjustment/hybrid_bundle_adjustment.cc`
 
@@ -666,7 +668,7 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
 4. 输出线段做 outlier-trim 聚合
   - `num_outliers_aggregator` 截断端点投影极值，减小少量错误支持影响
 
-### 4.8 定位分支（补充）
+### 6.8 定位分支（补充）
 
 位置：`src/limap/optimize/hybrid_localization/functions.py` + `estimators`
 
@@ -674,7 +676,7 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
 - `reprojection_filter_matches_2to3`：再按重投影距离和角度筛选
 - 最后 `RANSAC / Hybrid RANSAC`（点线双阈值）估计位姿并系统性剔除离群
 
-### 4.9 Fit&Merge 分支（补充）
+### 6.9 Fit&Merge 分支（补充）
 
 位置：`src/limap/fitting/fitting.py`
 
@@ -682,7 +684,7 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
 - 关键参数：`ransac_th`、`min_percentage_inliers`
 - 内点率低的候选直接丢弃，不进入后续 track 构建
 
-### 4.10 纹理密集场景的优先调参顺序
+### 6.10 纹理密集场景的优先调参顺序
 
 1. 先减重复检测
   - 打开/加强 `line2d.do_merge_lines`
