@@ -643,6 +643,410 @@ LIMAP 的 line2d 前端采用“注册器 + 多后端实现”插件化结构，
   - `greedy` 不稳时换 `avg` / `exhaustive`
   - 适当增大 `num_outliers_aggregator`
 
+## 5. Associate / Merging / BA / Localization 模块梳理
+
+这一章补齐第 4 章后半段没展开的“四个后端模块”：`merging`、`global_pl_association`、`hybrid_bundle_adjustment`、`hybrid_localization`。写法保持和 6.3 一样，按“入口 -> 核心实现 -> 参数与边界”展开。
+
+### 5.1 模块边界与入口（先看调用关系）
+
+1. `merging`（3D 线段成轨与后过滤）
+  - 代码：
+    - `src/limap/merging/merging.cc`
+    - `src/limap/merging/aggregator.cc`
+    - `src/limap/merging/merging_utils.cc`
+    - `src/limap/merging/merging.py`
+  - 入口：
+    - Fit&Merge 主流程：`src/limap/runners/line_fitnmerge.py`
+    - Triangulation 后处理：`src/limap/runners/line_triangulation.py`（`remerge/filter_*`）
+2. `global_pl_association`（点-线 / VP-线全局关联 + 联合优化）
+  - 代码：
+    - `src/limap/optimize/global_pl_association/global_associator.cc`
+    - `src/limap/optimize/global_pl_association/cost_functions.h`
+  - 入口：
+    - 主脚本：`runners/pointline_association.py`
+    - Python 封装：`src/limap/optimize/global_pl_association/__init__.py`
+3. `hybrid_bundle_adjustment`（点线联合 BA 核心引擎）
+  - 代码：
+    - `src/limap/optimize/hybrid_bundle_adjustment/hybrid_bundle_adjustment.cc`
+    - `src/limap/optimize/hybrid_bundle_adjustment/hybrid_bundle_adjustment_config.h`
+  - 入口：
+    - `src/limap/optimize/hybrid_bundle_adjustment/solve.py`
+    - 在 runner 中常见调用：`optimize.solve_line_bundle_adjustment(...)`
+4. `hybrid_localization`（线/点线定位：匹配过滤 + Ceres 位姿优化）
+  - 代码：
+    - `src/limap/optimize/hybrid_localization/hybrid_localization.cc`
+    - `src/limap/optimize/hybrid_localization/cost_functions.h`
+    - `src/limap/optimize/hybrid_localization/functions.py`
+  - 入口：
+    - 定位 runner：`src/limap/runners/hybrid_localization.py`
+    - 姿态估计桥接：`src/limap/estimators/absolute_pose/_pl_estimate_absolute_pose.py`
+    - C++ 估计器：`src/limap/estimators/absolute_pose/joint_pose_estimator.cc`
+
+### 5.2 Merging 模块：从离散 3D 线段到 LineTrack
+
+#### 5.2.1 输入输出与数据组织
+
+1. 输入（`MergeToLineTracks`）
+  - `all_lines_2d`: `{img_id: [Line2d]}`
+  - `all_lines_3d`: `{img_id: [Line3d]}`
+  - `neighbors`: `{img_id: [neighbor_img_id]}`
+  - `linker`: `LineLinker(2D + 3D 规则)`
+  - `imagecols`: 相机视图，用于跨图重投影检查
+2. 输出
+  - `Graph`：节点是 `(image_id, line_id)`，边是可合并关系
+  - `linetracks`：每个 track 包含 `line2d_list/line3d_list/score_list`，并聚合出一条最终 `track.line`
+3. 不确定度注入（Python 侧）
+  - `merging.merging(...)` 在进 C++ 前，会调用 `_SetUncertaintySegs3d`
+  - 每条 3D 线先按 `view + var2d` 估计 `uncertainty`，后续 3D linker 会用到
+
+#### 5.2.2 `MergeToLineTracks` 主流程（`merging.cc`）
+
+1. 初始化
+  - 强制把 `linker.linker_3d.config` 切到 `set_to_spatial_merging()`
+  - 只给 `length>0` 的 3D 线建图节点
+2. 候选边生成（同图 + 跨图）
+  - 同图：
+    - 两两线段先过 `linker.check_connection_3d(l1,l2)`
+    - 再过 `linker.check_connection_2d(line2d_i, line2d_j)`
+  - 跨图：
+    - 对 `image_id` 和 `neighbors[image_id]` 做候选
+    - 用奇偶 `key` 规避 OpenMP 重复配对
+    - 约束为“3D 可连 + 双向重投影 2D 可连”：
+      - `l1` 投影到邻图，与邻图 2D 线检查
+      - `l2` 投影回当前图，再检查一次
+3. 图边打分与入图
+  - `score = length(line1) + length(line2)`
+  - `graph.AddEdge(node1, node2, score)`
+4. 成轨（默认 Greedy）
+  - 直接调用 `ComputeLineTrackLabelsGreedy(...)`
+  - 然后按标签把节点的 `line2d/line3d/score` 填入对应 track
+5. 轨迹线聚合
+  - 每个 track 用 `Aggregator::aggregate_line3d_list(...)` 输出最终 `track.line`
+
+#### 5.2.3 三种 track-label 合并策略（`merging.h/.cc`）
+
+1. `ComputeLineTrackLabelsGreedy`
+  - 边按相似度降序做并查集合并
+  - 合并启发式按集合大小（`images_in_track.size()`）做 parent 选择
+  - 特点：快，默认路径使用它
+2. `ComputeLineTrackLabelsExhaustive`
+  - 先切到 `linker3d.config.set_to_avgtest_merging()`
+  - 合并两个集合前，遍历两集合中“有重叠”的线对，逐一 `check_connection`
+  - 特点：最严格，复杂度高
+3. `ComputeLineTrackLabelsAvg`
+  - 同样 `set_to_avgtest_merging()`
+  - 用每个集合的“均值线”先验做连通判定
+  - 特点：比 exhaustive 快，比 greedy 更保守
+
+#### 5.2.4 线聚合器 `Aggregator`（`aggregator.cc`）
+
+1. `n_lines < 4`
+  - 走 `takebest`（按 score 取最优）
+  - 同时把输出线 `uncertainty` 设为输入最小不确定度
+2. `n_lines >= 4`
+  - 所有端点做 TLS/SVD 主方向估计
+  - 把端点投影到主方向后排序
+  - 用 `num_outliers` 做两端截断，重建 `start/end`
+3. 工程含义
+  - 支持线多时，端点由“投影分位数”控制，鲁棒性强于简单均值
+
+#### 5.2.5 `RemergeLineTracks`（迭代重合并）
+
+1. 先按当前 `track.line` 两两建边
+  - 规则：`linker3d.check_connection(l1,l2)`
+  - 仅 `active=true` 的轨迹作为主遍历集合（减少开销）
+2. 并查集求连通分组
+  - 同组轨迹把 `node/image/line2d/line3d/score` 全部拼接
+3. 组内再聚合
+  - 再次 `Aggregator::aggregate_line3d_list(...)`
+  - 若某组只含 1 条原轨迹，则新轨迹 `active=false`
+4. Python 包装 `merging.remerge(...)`
+  - 会循环调用 `_RemergeLineTracks`，直到轨迹数不再减少
+
+#### 5.2.6 后过滤链（`merging_utils.cc`）
+
+1. `filter_tracks_by_reprojection`
+  - 对每条 support 检查：
+    - 角度误差 `angle <= th_angular_2d`
+    - 端点垂距 `dist_endperp <= th_perp_2d`
+  - 只保留通过的 support，再重聚合 3D 线
+2. `filter_tracks_by_sensitivity`
+  - 用 `track.line.sensitivity(view)` 判定每个 support
+  - 至少 `min_num_supports` 个不同图像通过才保留 track
+3. `filter_tracks_by_overlap`
+  - 比较 `track.line` 投影与 support 2D 线的 overlap
+  - 通过图像数达到 `min_num_supports` 才保留
+
+#### 5.2.7 在流程里的落点
+
+1. `line_fitnmerge.py`
+  - 先 `merging.merging(...)` 成轨
+  - 再 `filter_tracks_by_reprojection` -> `remerge` -> 再过滤
+2. `line_triangulation.py`
+  - 三角化输出 tracks 后，直接走同样的 `filter/remerge/filter` 后处理链
+
+### 5.3 Associate 模块：`GlobalAssociator`（点线 + VP 结构约束）
+
+#### 5.3.1 模块定位与输入
+
+1. 类继承关系
+  - `GlobalAssociator : HybridBAEngine`
+  - 继承了相机/点/线的 BA 几何残差与参数化
+2. 新增输入
+  - 2D 点线二部图：`all_bpt2ds_`（`PL_Bipartite2d`）
+  - 2D VP线二部图：`all_bpt2ds_vp_`（`VPLine_Bipartite2d`，可选）
+  - VP tracks / VP directions（可选）
+3. 典型入口（runner）
+  - `runners/pointline_association.py`：
+    - `InitImagecols / InitPointTracks / InitLineTracks`
+    - `Init2DBipartites_PointLine`
+    - 可选 `InitVPTracks + Init2DBipartites_VPLine`
+    - `SetUp()` -> `Solve()`
+
+#### 5.3.2 `SetUp` 的残差拼装（在 BA 基础上加结构项）
+
+1. 继承残差（R1）
+  - 点几何重投影残差（R1.1）
+  - 线几何重投影残差（R1.2）
+2. 新增结构残差（R2）
+  - R2.1 点-线 3D 关联残差：`PointLineAssociation3dFunctor`
+  - R2.2 VP-线 3D 关联残差：`VPLineAssociation3dFunctor`
+  - R2.3 VP 正交残差：`VPOrthogonalityFunctor`
+  - R2.4 VP 共线残差：`VPCollinearityFunctor`
+3. 参数化
+  - 相机/点/线：沿用 `HybridBAEngine`
+  - VP：`constant_vp=true` 时固定，否则 `SetSphereManifold<3>`
+
+#### 5.3.3 软关联权重怎么构造
+
+1. 点-线权重 `construct_weights_pointline`
+  - 遍历每条 line track 的每个 support
+  - 从 `all_bpt2ds_[img_id]` 拿该 2D 线的邻接点
+  - 点必须有 `point3D_id >= 0`
+  - 距离用“2D 点到 2D 线投影的垂距”
+  - `dist2weight` 当前是硬阈值：
+    - `dist <= th_pixel` 记 `1`
+    - 否则记 `0`
+  - 同一 `(point3d_id, line3d_id)` 在多图上求和，达到 `th_weight_pointline` 才保留
+2. VP-线权重 `construct_weights_vpline`
+  - 统计每条 line 在 supports 上对应到各 VP 的次数
+  - 每条 line 只保留“计数最高”的 VP
+  - 计数 `< th_count_vpline` 则丢弃
+3. 残差缩放
+  - 点-线：`weight * lw_pointline_association`
+  - VP-线：`count * 1e2 * lw_vpline_association`
+  - VP 正交/共线：`1e2 * lw_*`
+
+#### 5.3.4 `ReassociateJunctions`（可选补点）
+
+1. 从 2D bipartite 统计“同一 2D junction 连接到两条 3D line track”的证据
+2. 对每对 track 统计跨图计数，计数需 `>= th_count_lineline`
+3. 2D 与 3D 都要求角度足够大（`th_angle_lineline`）
+4. 通过两条 3D 线的中点构造一个新 `PointTrack`
+5. 回写对应 2D 点的 `point3D_id`
+6. 注意
+  - 该函数在 `runners/pointline_association.py` 默认是注释掉的（可人工开启）
+
+#### 5.3.5 输出阶段：软约束到硬关联
+
+1. `GetBipartite3d_PointLine_Constraints`
+  - 仅按软权重保留边（不加 3D 距离硬门槛）
+2. `GetBipartite3d_PointLine`
+  - 在软权重基础上，再加硬约束：
+    - `point-line 3D distance <= th_hard_pl_dist3d * point_uncertainty`
+  - `point_uncertainty` 取该点在各视图中的最小相机不确定度
+3. `GetBipartite3d_VPLine`
+  - 先按软计数关联，再过硬角度门槛：
+    - `angle(vp,line) <= th_hard_vpline_angle3d`
+  - 最后删掉度为 0 的 VP 节点
+4. 线段输出的稳健处理
+  - 先从优化后的无限线恢复有限线段
+  - 再做 `test_linetrack_validity`（至少半数 support 图像重投影有效）
+  - 不通过时回退到优化前 track 线段
+
+#### 5.3.6 配置分组（`GlobalAssociatorConfig`）
+
+1. 变量冻结
+  - `constant_intrinsics / constant_principal_point / constant_pose`
+  - `constant_point / constant_line / constant_vp`
+2. 结构权重
+  - `lw_pointline_association`
+  - `lw_vpline_association`
+  - `lw_vp_orthogonality`
+  - `lw_vp_collinearity`
+3. 软权重阈值
+  - `th_pixel`（源码字段名）
+  - `th_weight_pointline`
+  - `th_count_vpline`
+4. 硬输出阈值
+  - `th_hard_pl_dist3d`
+  - `th_hard_vpline_angle3d`
+
+### 5.4 BA 模块：`HybridBAEngine`（点线联合）
+
+#### 5.4.1 变量表示与状态
+
+1. 相机
+  - 来自 `ImageCollection`，参数块为 `intrinsics + qvec + tvec`
+2. 点
+  - `points_`: `track_id -> V3D`
+3. 线
+  - `lines_`: `track_id -> MinimalInfiniteLine3d(uvec,wvec)`
+  - `uvec` 用四元数表示旋转部分，`wvec` 是 2D 球面参数（正交表示）
+
+#### 5.4.2 残差项（`hybrid_bundle_adjustment.cc`）
+
+1. 点几何残差 `AddPointGeometricResiduals`
+  - 对每个点观测加 2 维重投影误差
+  - 按相机模型模板实例化 `PointGeometricRefinementFunctor`
+  - 全局权重 `lw_point`
+2. 线几何残差 `AddLineGeometricResiduals`
+  - 对每个 support 2D 线加几何残差
+  - cost 来自 `line_refinement::GeometricRefinementFunctor`
+  - 每条 support 的权重由 `ComputeLineWeights(track)` 给出（默认与 2D 线长成正比，`length/30`）
+3. `SetUp` 开关逻辑
+  - 若对应变量全是常量，则该类残差不会被加入问题
+
+#### 5.4.3 参数化与冻结策略
+
+1. 相机参数
+  - `constant_intrinsics=true`：内参全冻结
+  - 否则若 `constant_principal_point=true`：只冻结主点参数（subset manifold）
+  - `constant_pose=true`：`qvec/tvec` 全冻结，否则对 `qvec` 施加四元数流形
+2. 点参数
+  - `constant_point=true` 时冻结
+3. 线参数
+  - 若 `constant_line=true` 或 `track.count_images() < min_num_images`：冻结该线
+  - 否则 `uvec` 上四元数流形，`wvec` 上 `SphereManifold<2>`
+4. 实用快捷
+  - `HybridBAConfig.set_constant_camera()` 一次性冻结内参与位姿（runner 常用）
+
+#### 5.4.4 求解器与输出
+
+1. 求解器选择（按图像数量）
+  - `<= 50`: `DENSE_SCHUR`
+  - `<= 900`: `SPARSE_SCHUR`
+  - `> 900`: `ITERATIVE_SCHUR + SCHUR_JACOBI`
+2. 输出线段恢复
+  - 从优化后的无限线 + 原 track 支持线段恢复有限线段
+  - 使用 `num_outliers` 截断端点投影极值（鲁棒端点）
+3. 输出接口
+  - `GetOutputImagecols / GetOutputPoints / GetOutputPointTracks`
+  - `GetOutputLines / GetOutputLineTracks`
+
+#### 5.4.5 和 runner 的接线方式
+
+1. `line_triangulation.py` / `line_fitnmerge.py`
+  - 都在后过滤后调用 `solve_line_bundle_adjustment(...)`
+  - 再用 `GetOutputLineTracks(num_outliers_aggregator)` 替换轨迹几何
+2. 与 `GlobalAssociator` 的关系
+  - `GlobalAssociator` 直接复用这个引擎（几何项 + 参数化 + solver 选择）
+
+### 5.5 定位模块：`hybrid_localization`（线、点线位姿优化）
+
+#### 5.5.1 两层结构
+
+1. 匹配与过滤层（Python）
+  - `match_line_2to2_epipolarIoU`
+  - `filter_line_2to2_epipolarIoU`
+  - `match_line_2to3`
+  - `reprojection_filter_matches_2to3`
+2. 优化与估计层（C++ + Python 包装）
+  - Ceres 引擎：`LineLocEngine` / `JointLocEngine`
+  - RANSAC 估计器：`JointPoseEstimator` 与 Hybrid/RANSAC 包装
+
+#### 5.5.2 2D->3D 线匹配构建（`functions.py`）
+
+1. `match_line_2to2_epipolarIoU`
+  - 参考图/目标图线段两两计算 epipolar IoU
+  - `IoU > threshold` 才保留
+2. `match_line_2to3`
+  - 用 `line2track[tgt_img_id][tgt_line_id]` 把 2D-2D 对映射为 2D-3D track 对
+3. `reprojection_filter_matches_2to3`
+  - 对每条 query 2D 线，从候选 track 中挑损失最小者
+  - 支持距离函数：
+    - `Perpendicular`
+    - `Midpoint`
+    - `Midpoint_Perpendicular`
+  - `Midpoint` 模式还会叠加方向差惩罚并用 `sine_thres` 过滤大角差
+
+#### 5.5.3 `LineLocEngine` / `JointLocEngine` 优化细节
+
+1. 变量
+  - 内参 `kvec`（固定）
+  - 外参 `qvec + tvec`（优化）
+2. 线残差构建
+  - 同一条 3D 线可对应多条 2D 线
+  - 每条 2D 线残差按 `length / sum_lengths` 归一化加权
+3. 点残差（`JointLocEngine`）
+  - 额外加入点重投影（或点到视线 3D 距离）残差
+  - 总权重由 `weight_line` 与 `weight_point` 控制
+4. 求解器
+  - 统一 `DENSE_QR`
+
+#### 5.5.4 可选线残差与权重函数（`cost_functions.h`）
+
+1. 线残差类型 `LineLocCostFunction`
+  - 2D：`E2DMidpointDist2` / `E2DMidpointAngleDist3`
+  - 2D：`E2DPerpendicularDist2` / `E2DPerpendicularDist4`
+  - 3D：`E3DLineLineDist2` / `E3DPlaneLineDist2`
+2. 残差权重类型 `LineLocCostFunctionWeight`
+  - `ENoneWeight / ECosineWeight / ELine3dppWeight / ELengthWeight / EInvLengthWeight`
+3. 点残差模式切换
+  - 当线损失选 `E3DLineLineDist2` 或 `E3DPlaneLineDist2` 时，代码会开启 `points_3d_dist=true`
+  - 这时点项使用“点到视线 3D 距离”而非 2D 重投影差
+
+#### 5.5.5 与绝对位姿估计器的耦合
+
+1. Python 入口 `_pl_estimate_absolute_pose(...)`
+  - `ransac.method is None`：直接 `optimize.solve_jointloc(...)` 做纯优化
+  - 否则走 `EstimateAbsolutePose_PointLine` / `EstimateAbsolutePose_PointLine_Hybrid`
+2. C++ 最小求解器组合（`joint_pose_estimator.cc`）
+  - `3点0线` -> `p3p`
+  - `2点1线` -> `p2p1ll`
+  - `1点2线` -> `p1p2ll`
+  - `0点3线` -> `p3ll`
+3. 非最小与最小二乘精化
+  - 非最小样本和最终 LS 都会用 `JointLocEngine` 做局部优化
+4. 内点评估
+  - 点：重投影误差（或 3D 视线距离）
+  - 线：`ReprojectionLineFunctor` 对应残差范数
+  - 都带 cheirality 检查；线还额外检查重投影重叠长度
+
+#### 5.5.6 `runners/hybrid_localization.py` 的落地时序
+
+1. 先准备 query/db 线段与 `line2track` 映射
+2. 根据 `localization.2d_matcher`：
+  - `epipolar`：在线几何上直接筛配对
+  - 其他 matcher：先提取/匹配，再可选 `epipolar_filter`
+3. 线匹配转 2D->3D 后，可选 `reprojection_filter` 压成 1-1
+4. 取 HLoc 点对应 + 线对应，调用 `estimators.pl_estimate_absolute_pose(...)`
+5. 输出每个 query 的最终 `qvec + tvec`
+
+### 5.6 四模块串联视角（工程上怎么连）
+
+1. Triangulation 主线（最常见）
+  - `triangulation` 产出 `linetracks`
+  - `merging.filter/remerge` 做轨迹清洗
+  - `hybrid_bundle_adjustment` 做几何精化
+2. Fit&Merge 分线
+  - 深度/点云先拟合单图 3D 线
+  - `merging` 跨图成轨 + 后过滤
+  - 可选 `hybrid_bundle_adjustment`
+3. 结构关联分线
+  - 读取已有 `pointtracks + linetracks + 2d bipartite`
+  - `global_pl_association` 做点线/VP线联合优化与关联输出
+4. 定位分线
+  - query 与 db 建立线对应（可混点对应）
+  - RANSAC（可选）+ `JointLocEngine` 精化
+  - 输出 query 位姿
+
+对这四块的实践调参顺序通常是：
+1. 先稳 correspondence（2D-2D、2D-3D 过滤）
+2. 再调 merging 阈值（角度/重叠/垂距）
+3. 再放 BA（确认 `min_num_images`、常量开关）
+4. 最后再加结构项（point-line / vp-line）和定位联合权重
+
 ---
 
 ## 6. 误检与误匹配抑制：多级闸门 + 调参顺序
